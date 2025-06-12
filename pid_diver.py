@@ -5,6 +5,8 @@ from collections import deque
 import ubluetooth 
 from micropython import const # Optimize constants at runtime
 import struct
+import sys
+import select
 
 # Bluetooth
 _IRQ_CENTRAL_CONNECT = const(1)
@@ -19,13 +21,13 @@ DATA_PID = const(0x44)
 
 # General
 LOG_TIME = const(1000) # ms
+SAFE_MODE_PIN = Pin(10, Pin.IN, Pin.PULL_UP)
 SERVO_PIN = const(2)
 PRESSURE_SENSOR_PIN = const(3)
 
 # Servo
 SERVO_STOPPED = const(1.5) # ms
 SERVO_MOVE_RANGE = const(0.5) # ms
-SERVO_SLEEP = const(50) # ms
 
 # Pressures sensor (depth)
 WATER_DENSITY = const(1000) # kg/m³
@@ -36,7 +38,7 @@ MAX_PRESSURE_RATING = const(206843) # Pa
 ATMOSPHERE_PRESSURE = const(101325) # Pa
 
 # Syringe
-SECONDS_PER_ML = const(0.2)
+SECONDS_PER_ML = const(0.85)
 
 # PID
 PID_CALLBACK_TIME = const(10) # ms
@@ -53,14 +55,13 @@ class Servo:
 
     def set_duty_ms(self, ms):
         self.pwm.duty_ns(int(ms * 1e6))
-        sleep(SERVO_SLEEP * 1e-3)
         
     def stop(self):
         self.set_duty_ms(SERVO_STOPPED)
 
     # -1 is backward the fastest and 1 is forward the fastest
     def move(self, speed):
-        duty_ms = (SERVO_STOPPED + max(-1, min(1, speed * SERVO_MOVE_RANGE)))
+        duty_ms = (SERVO_STOPPED + max(-0.5, min(0.5, speed * SERVO_MOVE_RANGE)))
         self.set_duty_ms(duty_ms)
         
 class Syringe:
@@ -134,7 +135,7 @@ class PID:
     
     def run(self):
         self.change_ml = self.compute(self.error())
-        self.syringe.move(change_ml)
+        self.syringe.move(self.change_ml)
 
 class Bluetooth:
     def __init__(self, name, pressure_sensor, syringe):   
@@ -170,14 +171,12 @@ class Bluetooth:
         while self.connected:
             try:
                 data = self.queue.popleft()
-                print("Sending: " + data)
                 self.ble.gatts_write(self.tx, data, True)
             except:
                 return
      
     def send(self, data):
         try:
-            print("Queueing: " + data)
             self.queue.append(data)
             self.send_queued()
         except:
@@ -208,9 +207,10 @@ class Bluetooth:
         self.send(data)  
         
     def send_data(self):
-        self.send_pressure_data()
-        if self.pid is not None:
-            self.send_pid_data()
+        if self.connected:
+            self.send_pressure_data()
+            if self.pid is not None:
+                self.send_pid_data()
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
     def dive(self, dive_milliliters, kp, ki, kd, ke, integral_bound):
@@ -235,16 +235,19 @@ class Bluetooth:
         if len(buffer) < 1:
             return None, None
             
+        print(f"Buffer: {buffer}, Len: {len(buffer)}, CMD: {buffer[0]}")
+
         cmd_id = buffer[0]
         
-        if cmd_id == CMD_DIVE and len(buffer) >= 8:
+        if cmd_id == CMD_DIVE and len(buffer) >= 10:
             try:
-                _, dive_ml, kp_raw, ki_raw, kd_raw, ke, integral_bound = struct.unpack('>BBHHHBb', buffer[:8])
+                _, dive_ml, kp_raw, ki_raw, kd_raw, ke, integral_bound = struct.unpack('>BBHHHBb', buffer[:10])
                 kp = kp_raw / 1000.0
                 ki = ki_raw / 1000.0  
                 kd = kd_raw / 1000.0
                 return 'd', [dive_ml, kp, ki, kd, ke, integral_bound]
             except:
+                print("Failed to unpack dive")
                 return None, None
                 
         elif cmd_id == CMD_MOVE_FORWARD and len(buffer) >= 2:
@@ -278,6 +281,7 @@ class Bluetooth:
         elif event == _IRQ_GATTS_WRITE:
             buffer = self.ble.gatts_read(self.rx)
             command, argument = self.parse_request(buffer)
+            print(f"Received data: {command}, {argument}")
                
             if command == 'd':
                 if(self.pid == None):
@@ -311,11 +315,15 @@ class Float:
         self.bluetooth = Bluetooth("DemonDiver", self.pressure_sensor, self.syringe)
 
 try:
-    print("Starting Float")
-    float = Float()
-    while True:
-        print(".")
-        sleep(1)
+    if SAFE_MODE_PIN.value() == 1:
+        print("Starting Float")
+        float = Float()
+        while True:
+            if not float.bluetooth.connected:
+                print(".")
+            sleep(1)
+    else:
+        print("Safety Pin Activated, Quitting...")
 except KeyboardInterrupt:
     print("Keyboard Interrupt")
     exit()

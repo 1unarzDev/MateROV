@@ -13,7 +13,7 @@ KD = 0.1
 KE = 5
 INTEGRAL_BOUND = 3
 MOVE_INCREMENT = 5
-DIVE_ML = 40
+DIVE_ML = 5
 
 root = tkinter.Tk()
 root.wm_title("Diver Controller")

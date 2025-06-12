@@ -30,7 +30,6 @@ class DiverCom():
         self.connected = False
 
     def handle_rx(self, BleakGATTCharacteristic, data: bytearray):
-        print("Received binary data: " + data)
         self.on_received(data)
 
     def send(self, data_bytes):
