@@ -31,7 +31,7 @@ class DiverCom():
 
     def handle_rx(self, BleakGATTCharacteristic, data: bytearray):
         message = data.decode('utf-8')
-        print("Received: " + message) # Might be more helpful to label each piece of data as it is unpacked
+        print("Received: " + message)
         self.on_received(message)
 
     def send(self, string_utf8):
@@ -43,7 +43,7 @@ class DiverCom():
             s = bytearray(string_utf8, "utf-8")
             await self.client.write_gatt_char(self.rx_char, s, response=True)
         else:
-            await asyncio.sleep(0.5)  # Queue empty wait to try again, try changing this value later for faster comm
+            await asyncio.sleep(0.5)
 
     async def run(self):
         while True:

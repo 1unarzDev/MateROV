@@ -1,32 +1,48 @@
-from machine import Timer, RTC, Pin, PWM, ADC
+from machine import Timer, Pin, PWM, ADC
 from sys import exit
 from time import time, sleep
 from collections import deque
 import ubluetooth 
-from micropython import const
+from micropython import const # Optimize constants at runtime
 
-# Micropython const function optimizes code at runtime
+# Bluetooth
 _IRQ_CENTRAL_CONNECT = const(1)
 _IRQ_CENTRAL_DISCONNECT = const(2)
 _IRQ_GATTS_WRITE = const(3)
 _IRQ_PERIPHERAL_DISCONNECT = const(8)
-CALLBACK_TIME = const(1000) # ms
+
+# General
+LOG_TIME = const(1000) # ms
+SERVO_PIN = const(2)
+PRESSURE_SENSOR_PIN = const(3)
+
+# Servo
 SERVO_STOPPED = const(1.5) # ms
 SERVO_MOVE_RANGE = const(0.5) # ms
 SERVO_SLEEP = const(50) # ms
+
+# Pressures sensor (depth)
 WATER_DENSITY = const(1000) # kg/m³
 GRAVITY = const(9.81) # m/s²
-CALLBACK_TIME = const(100) # ms
 MIN_PRESSURE_VOLTAGE = const(0.5) # V
 MAX_PRESSURE_VOLTAGE = const(4.5) # V
 MAX_PRESSURE_RATING = const(206843) # Pa
 ATMOSPHERE_PRESSURE = const(101325) # Pa
+
+# Syringe
 SECONDS_PER_ML = const(0.2)
 
+# PID
+PID_CALLBACK_TIME = const(100) # ms
+FLOAT_VOLUME = const(600) # cm^3
+FLOAT_MASS = const(550) # g
+DIVE_TIME = const(45000) # ms
+DESIRED_DEPTH = const(2.5) # m
+
 # Continuous rotation servo which takes in input speeds (pulse widths in ms) rather than positional inputs
-class Servo():
+class Servo:
     def __init__(self):
-        self.pwm = PWM(Pin(2))
+        self.pwm = PWM(Pin(SERVO_PIN))
         self.pwm.freq(50)
 
     def set_duty_ms(self, ms):
@@ -41,18 +57,19 @@ class Servo():
         duty_ms = (SERVO_STOPPED + max(-1, min(1, speed * SERVO_MOVE_RANGE)))
         self.set_duty_ms(duty_ms)
         
-class Syringe():
+class Syringe:
     def __init__(self):
-        self.servo=Servo()
+        self.servo = Servo()
+        self.timer = Timer(0) # Only one syringe allowed
         
-    def move_syringe(self,ml):
-        self.servo.move(ml / abs(ml)) # Move in appropriate direction
-        sleep(ml*self.SECONDS_PER_ML)
-        self.servo.stop()
+    def move(self,ml):
+        self.servo.move(-ml / abs(ml)) # Move in appropriate direction
+        wait_time = abs(ml) * self.SECONDS_PER_ML * 1000
+        self.timer.init(period=wait_time, mode=Timer.ONE_SHOT, callback=lambda t: self.servo.stop())
 
 class PressureSensor:
     def __init__(self):
-        self.sensor = ADC(Pin(3))
+        self.sensor = ADC(Pin(PRESSURE_SENSOR_PIN))
         self.sensor.atten(ADC.ATTN_11DB)
     
     def read_voltage(self):
@@ -67,23 +84,25 @@ class PressureSensor:
         depth = pressure / (WATER_DENSITY * GRAVITY)
         return depth
 
-class PID():
-    # TODO: Tune the PID parameters in the controller
-    def __init__(self, pressure_sensor, desired_depth, syringe, dive_time=20, kp=0.8, ki=0.02, kd=0.1, integral_bound=3):
-        self.time = dive_time
-        self.time_left = self.time
+class PID:
+    def __init__(self, pressure_sensor, syringe, kp, ki, kd, ke, integral_bound):
+        self.desired_depth = DESIRED_DEPTH
         self.kp = kp
         self.ki = ki
         self.kd = kd
+        self.ke = ke
         self.integral_bound = integral_bound
         self.pressure_sensor = pressure_sensor
-        self.desired_depth = desired_depth
         self.syringe = syringe
         self.prev_t = time()
+        self.integral = 0
         self.dt = 0
-        
-    def depth_to_ml(ml):
-        return ml * AVERAGE_CROSS_SECTIONAL_AREA * 1e6 
+        self.change_ml = 0
+    
+    # Assumes water density of 1 g/cm^3 or 1 g/mL and uses some fancy logic to do with water displacement relative to float volume and mass
+    def error(self):
+        m = FLOAT_VOLUME - FLOAT_MASS + self.ke * DESIRED_DEPTH
+        return m * (DESIRED_DEPTH - self.pressure_sensor.read_depth()) 
 
     def compute(self, error):
         self.t = time()
@@ -91,38 +110,34 @@ class PID():
         self.prev_t = self.t
 
         self.integral += error * self.dt
-        self.integral = np.clip(self.integral, -self.integral_bound, self.integral_bound)  
+        self.integral = max(-self.integral_bound, min(self.integral, self.integral_bound))
         derivative = (error - self.prev_error) / self.dt
         self.prev_error = error
 
-        ml = (self.Kp * error) + (self.Kd * derivative) + (self.Ki * self.integral)
-        return depth_to_ml(ml) 
+        ml = (self.Kp * error) + (self.Ki * self.integral) + (self.Kd * derivative)
+        return ml
     
-    def run():
-        while(self.time_left > 0):
-            # TODO: Find the average intial error of the depth (e.g., it says that it is 5m before entering the water, then adjust for it)
-            error = self.pressure_sensor.read()/GRAVITY - self.desired_depth
-            self.syringe.move_syringe(compute(error))
-            self.time_left -= self.dt
+    def run(self):
+        self.change_ml = self.compute(self.error())
+        self.syringe.move(change_ml)
 
-class BLE():
-    def __init__(self, name):   
+class Bluetooth:
+    def __init__(self, name, pressure_sensor, syringe):   
         self.name = name.encode('UTF-8')
-        self.syringe = Syringe()
-        
-        # Setup the bluetooth
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
-        self.timer = Timer(0)
         self.connHandle = 0
-        self.queue = deque((), 100)
+        self.queue = deque((), DIVE_TIME / LOG_TIME * 2)
         self.connected = False
         self.disconnect()
         self.ble.irq(self.ble_irq)
         self.register()
         self.advertiser()
-        self.pressure_sensor = PressureSensor()
-        self.timer.init(period=CALLBACK_TIME, mode=Timer.PERIODIC, callback=lambda t: self.send_data())
+        self.pressure_sensor = pressure_sensor
+        self.syringe = syringe
+        self.pid = None
+        self.timer = Timer(2)
+        self.timer.init(period=LOG_TIME, mode=Timer.PERIODIC, callback=lambda t: self.send_data())
 
     def connect(self, data):
         self.connHandle = data[0]
@@ -130,8 +145,8 @@ class BLE():
         print("Connected")
 
     def disconnect(self):        
-         self.connected = False
-         print("Disconnected")
+        self.connected = False
+        print("Disconnected")
          
     def send_queued(self):
         while self.connected:
@@ -150,34 +165,36 @@ class BLE():
         except:
             return
         
-    # Message in format [time, kpa, millivolts, depth]
+    # Message in format [time, voltage, pressure, depth, error, change_ml]
     def send_data(self):
-        millivolts = self.pressure_sensor.read_millivolts()
-        kpa = self.pressure_sensor.read()
-        data = f"D,{time()},{kpa},{millivolts},{kpa/GRAVITY}" # Dividing killopascals by gravity tells us the depth in water 
+        voltage = self.pressure_sensor.read_voltage()
+        pressure = self.pressure_sensor.read_pressure()
+        depth = self.pressure_sensor.read_depth()
+        data = f"D,{time()},{voltage},{pressure},{depth}" 
+        if(self.pid != None):
+            data += f",{self.pid.error},{self.pid.change_ml}"
         self.send(data)
-
-    def set_utc(self, argument):
-        try:
-            print(argument)
-            if argument != None:
-                splits = argument.split(':')
-                if len(splits) == 3:
-                    hours = int(splits[0])
-                    minutes = int(splits[1])
-                    seconds = int(splits[2])
-                    RTC().datetime((2023,5,6,1,hours,minutes,seconds,0))
-                    print(rtc.datetime())
-        except:
-            return
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
-    def dive(self, dive_milliliters, time, kp, ki, kd, integral_bound, desired_depth):
+    def dive(self, dive_milliliters, kp, ki, kd, ke, integral_bound):
         self.send(f"Diving for: {dive_milliliters} milliliters")
-        self.syringe.move_syringe(-dive_milliliters)
-        self.pid = PID(self.pressure_sensor, desired_depth, self.syringe, time, kp, ki, kd, integral_bound)
-        self.pid.run()
-        self.syringe.move_syringe(dive_milliliters + DIVE_SURFACE_BUFFER)
+        self.syringe.move_syringe(dive_milliliters)
+        self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, ke, integral_bound)
+        
+        self.dive_milliliters = dive_milliliters
+        self.dive_start_time = time.ticks_ms()
+
+        self.dive_timer = Timer(1)
+        self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=self.pid_run)
+    
+    def pid_run(self):
+        elapsed = time.ticks_diff(time.ticks_ms(), self.dive_start_time)
+        if elapsed < DIVE_TIME:
+            self.pid.run()
+        else:
+            self.dive_timer.deinit()
+            self.syringe.move_syringe(-self.dive_milliliters)
+            self.pid = None
 
     # Parse request as request and a single argument
     def parse_request(self, message):
@@ -208,17 +225,15 @@ class BLE():
             message = buffer.decode('UTF-8').strip()
             print(message)
             command,argument = self.parse_request(message)
-            if (command == 'time') or (command == 't'):
-               self.set_utc(argument)
-               self.send("Time Set")
                
-            if (command == 'dive') or (command == 'd'):
-                self.dive(*list(map(int, argument.split(",")[:7])))
+            if command == 'd':
+                if(self.pid == None):
+                    self.dive(*list(map(int, argument.split(",")[:6])))
                 
-            if (command == 'forward') or (command == 'f'):
+            if command == 'f':
                 self.syringe.move_syringe(int(argument))
                 
-            if (command == 'backward') or (command == 'b'):
+            if command == 'b':
                 self.syringe.move_syringe(-int(argument))
            
     def register(self):        
@@ -238,16 +253,20 @@ class BLE():
     def advertiser(self):
         name = bytes(self.name, 'UTF-8')
         self.ble.gap_advertise(100, bytearray('\x02\x01\x02') + bytearray((len(name) + 1, 0x09)) + name)
-    
-    def run(self):
-        ...
 
-# Runtime loop
-while True:
-    try:
-        ble = BLE("DemonDiver")
-    except KeyboardInterrupt:
-        print("Keyboard Interrupt")
-        exit()
-    except Exception as exp:
-        print(exp)
+class Float:
+    def __init__(self):
+        self.pressure_sensor = PressureSensor()
+        self.syringe = Syringe()
+        self.bluetooth = Bluetooth("DemonDiver", self.pressure_sensor, self.syringe)
+
+try:
+    print("Starting Float")
+    float = Float()
+    while True:
+        sleep(1)
+except KeyboardInterrupt:
+    print("Keyboard Interrupt")
+    exit()
+except Exception as exp:
+    print(exp)

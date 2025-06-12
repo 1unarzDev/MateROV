@@ -4,19 +4,15 @@ import queue
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import asyncio
-from random import uniform
 import com
 
-# TODO: Find good pid parameter values
-TURN_RATIO = 23/50 # Turn ratio from testing
-DIVE_TIME = 20
 KP = 0.8
 KI = 0.02
 KD = 0.1
+KE = 5
 INTEGRAL_BOUND = 3
-MOVE_INCREMENT = 5 # Defines move command movement
-COMPANY_NUMBER = 2
-DESIRED_DEPTH = 2.5 # TODO: Find the desired depth in meters
+MOVE_INCREMENT = 5
+DIVE_ML = 40
 
 root = tkinter.Tk()
 root.wm_title("Diver Controller")
@@ -27,7 +23,8 @@ fig = Figure(figsize=(5, 4), dpi=100)
 times = []
 base_time = None
 depths = []
-syringe_volumes = []
+errors = []
+move_mls = []
 ax = None
 diver_com = com.DiverCom("DemonDiver")
 
@@ -40,38 +37,39 @@ def update_line():
         fig.delaxes(ax)
     ax = fig.add_subplot()
     ax.plot(times, depths, label="Depth (m)")
+    if errors:
+        ax.plot(times[:len(errors)], errors, label="Error")
+    if move_mls:
+        ax.plot(times[:len(move_mls)], move_mls, label="Move mL")
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Depth (m) / Volume (mL)")
+    ax.set_ylabel("Values")
+    ax.legend()
     canvas.draw()
 
-# Message in format [time, kpa, millivolts, depth]
 def handle_data_message(msg):
-    # See send_data() in the BLE class of pid_diver.py 
     global base_time
-    
     data = msg.split(",")
-    # First element in array is the command "D"
-    if len(data) < 4:
+    if len(data) < 5:
         return
     t = int(data[1])
-    kpa = float(data[2])
-    millivolts = float(data[3])
+    voltage = float(data[2])
+    pressure = float(data[3])
     depth = float(data[4])
+    error = float(data[5]) if len(data) > 5 else 0
+    move_ml = float(data[6]) if len(data) > 6 else 0
 
-    parsed_msg = f"Time: {t}, Kpa: {kpa}, Millivolts: {millivolts}, Depth: {depth}" 
+    parsed_msg = f"Time: {t}, Voltage: {voltage:.2f} V, Pressure: {pressure:.1f} Pa, Depth: {depth:.2f} m, Error: {error:.3f}, Move: {move_ml:.3f}" 
     print(parsed_msg)
 
-    # Log data
     with open("diverLog.txt", "a") as f:
-        f.write(parsed_msg)
+        f.write(parsed_msg + "\n")
 
-    # Update time from diver
     if base_time is None:
         base_time = t
-    times.append(t - base_time)
-
-    # Update depth data from pressure sensor
+    times.append((t - base_time) / 1000)
     depths.append(depth)
+    errors.append(error)
+    move_mls.append(move_ml)
 
     update_line()
 
@@ -86,35 +84,33 @@ def handle_message():
     root.after(100, handle_message)
 
 def dive():
-    diver_com.send(f"d {30/TURN_RATIO},{DIVE_TIME},{KP},{KI},{KD},{INTEGRAL_BOUND},{DESIRED_DEPTH}") # Must maintain this exact format or match diver pid 
+    diver_com.send(f"d {DIVE_ML},{KP},{KI},{KD},{KE},{INTEGRAL_BOUND}")
 
 def forward():
-    diver_com.send(f"f {5/TURN_RATIO}")
+    diver_com.send(f"f {MOVE_INCREMENT}")
 
 def backward():
-    diver_com.send(f"b {5/TURN_RATIO}")
+    diver_com.send(f"b {MOVE_INCREMENT}")
 
 def reset_graph():
-    global base_time, depths, times
+    global base_time, depths, times, errors, move_mls
     base_time = None
     depths = []
     times = []
+    errors = []
+    move_mls = []
     update_line()
     print("Graph Reset")
 
-# Basic syringe movement commands
 button_forward = tkinter.Button(master=root, text=f"Down {MOVE_INCREMENT} mL", command=forward)
 button_backward = tkinter.Button(master=root, text=f"Up {MOVE_INCREMENT} mL", command=backward)
-
-# UI Components
 button_quit = tkinter.Button(master=root, text="Quit", command=root.destroy)
 button_dive = tkinter.Button(master=root, text="Dive", command=dive)
 button_reset = tkinter.Button(master=root, text="Reset Graph", command=reset_graph)
 
 label_connected = tkinter.Label(master=root, text="Not Connected", bg="red", fg="white")
-label_message = tkinter.Label(master=root, width=20)
+label_message = tkinter.Label(master=root, width=40)
 
-# Layout Adjustments
 label_message.pack(side=tkinter.BOTTOM, fill=tkinter.X)
 canvas.get_tk_widget().pack(side=tkinter.TOP, fill=tkinter.BOTH, expand=True)
 button_quit.pack(side=tkinter.RIGHT)

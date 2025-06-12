@@ -1,4 +1,4 @@
-from machine import Timer, Pin, ADC, PWM
+from machine import Pin, ADC
 from sys import exit
 from time import sleep
 
