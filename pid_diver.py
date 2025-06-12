@@ -1,15 +1,21 @@
 from machine import Timer, Pin, PWM, ADC
 from sys import exit
-from time import time, sleep
+from time import sleep, ticks_ms, ticks_diff
 from collections import deque
 import ubluetooth 
 from micropython import const # Optimize constants at runtime
+import struct
 
 # Bluetooth
 _IRQ_CENTRAL_CONNECT = const(1)
 _IRQ_CENTRAL_DISCONNECT = const(2)
 _IRQ_GATTS_WRITE = const(3)
 _IRQ_PERIPHERAL_DISCONNECT = const(8)
+CMD_DIVE = const(0x01)
+CMD_MOVE_FORWARD = const(0x02)
+CMD_MOVE_BACKWARD = const(0x03)
+DATA_PRESSURE = const(0x50)
+DATA_PID = const(0x44)     
 
 # General
 LOG_TIME = const(1000) # ms
@@ -33,7 +39,7 @@ ATMOSPHERE_PRESSURE = const(101325) # Pa
 SECONDS_PER_ML = const(0.2)
 
 # PID
-PID_CALLBACK_TIME = const(100) # ms
+PID_CALLBACK_TIME = const(10) # ms
 FLOAT_VOLUME = const(600) # cm^3
 FLOAT_MASS = const(550) # g
 DIVE_TIME = const(45000) # ms
@@ -60,12 +66,20 @@ class Servo:
 class Syringe:
     def __init__(self):
         self.servo = Servo()
-        self.timer = Timer(0) # Only one syringe allowed
-        
-    def move(self,ml):
-        self.servo.move(-ml / abs(ml)) # Move in appropriate direction
-        wait_time = abs(ml) * self.SECONDS_PER_ML * 1000
-        self.timer.init(period=wait_time, mode=Timer.ONE_SHOT, callback=lambda t: self.servo.stop())
+        self.active = False
+        self.end_time = 0
+
+    def move(self, ml):
+        direction = -ml / abs(ml)
+        self.servo.move(direction)
+        wait_ms = int(abs(ml) * SECONDS_PER_ML * 1000)
+        self.end_time = ticks_ms() + wait_ms
+        self.active = True
+
+    def update(self):
+        if self.active and ticks_diff(ticks_ms(), self.end_time) >= 0:
+            self.servo.stop()
+            self.active = False
 
 class PressureSensor:
     def __init__(self):
@@ -94,7 +108,8 @@ class PID:
         self.integral_bound = integral_bound
         self.pressure_sensor = pressure_sensor
         self.syringe = syringe
-        self.prev_t = time()
+        self.prev_t = ticks_ms()
+        self.prev_error = 0
         self.integral = 0
         self.dt = 0
         self.change_ml = 0
@@ -105,8 +120,8 @@ class PID:
         return m * (DESIRED_DEPTH - self.pressure_sensor.read_depth()) 
 
     def compute(self, error):
-        self.t = time()
-        self.dt = self.t - self.prev_t
+        self.t = ticks_ms()
+        self.dt = ticks_diff(self.t, self.prev_t) / 1000
         self.prev_t = self.t
 
         self.integral += error * self.dt
@@ -114,7 +129,7 @@ class PID:
         derivative = (error - self.prev_error) / self.dt
         self.prev_error = error
 
-        ml = (self.Kp * error) + (self.Ki * self.integral) + (self.Kd * derivative)
+        ml = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
         return ml
     
     def run(self):
@@ -123,11 +138,11 @@ class PID:
 
 class Bluetooth:
     def __init__(self, name, pressure_sensor, syringe):   
-        self.name = name.encode('UTF-8')
+        self.name = name
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
         self.connHandle = 0
-        self.queue = deque((), DIVE_TIME / LOG_TIME * 2)
+        self.queue = deque((), int(DIVE_TIME / LOG_TIME * 2))
         self.connected = False
         self.disconnect()
         self.ble.irq(self.ble_irq)
@@ -136,8 +151,11 @@ class Bluetooth:
         self.pressure_sensor = pressure_sensor
         self.syringe = syringe
         self.pid = None
-        self.timer = Timer(2)
+        self.timer = Timer(0)
         self.timer.init(period=LOG_TIME, mode=Timer.PERIODIC, callback=lambda t: self.send_data())
+        self.dive_timer = Timer(1)
+        self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=lambda t: self.pid_run())
+        self.elapsed = 0
 
     def connect(self, data):
         self.connHandle = data[0]
@@ -153,7 +171,7 @@ class Bluetooth:
             try:
                 data = self.queue.popleft()
                 print("Sending: " + data)
-                self.ble.gatts_write(self.tx, data + '\n',True)
+                self.ble.gatts_write(self.tx, data, True)
             except:
                 return
      
@@ -164,48 +182,86 @@ class Bluetooth:
             self.send_queued()
         except:
             return
-        
-    # Message in format [time, voltage, pressure, depth, error, change_ml]
-    def send_data(self):
+
+    def send_pressure_data(self):
         voltage = self.pressure_sensor.read_voltage()
         pressure = self.pressure_sensor.read_pressure()
         depth = self.pressure_sensor.read_depth()
-        data = f"D,{time()},{voltage},{pressure},{depth}" 
-        if(self.pid != None):
-            data += f",{self.pid.error},{self.pid.change_ml}"
+        
+        data = struct.pack('>BHfff', 
+                          DATA_PRESSURE,
+                          self.elapsed,
+                          voltage,      
+                          pressure,     
+                          depth)        
         self.send(data)
+
+    def send_pid_data(self):
+        error = self.pid.error()
+        moved_ml = self.pid.change_ml
+        
+        data = struct.pack('>BHff', 
+                          DATA_PID,    
+                          self.elapsed,
+                          error,       
+                          moved_ml)    
+        self.send(data)  
+        
+    def send_data(self):
+        self.send_pressure_data()
+        if self.pid is not None:
+            self.send_pid_data()
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
     def dive(self, dive_milliliters, kp, ki, kd, ke, integral_bound):
         self.send(f"Diving for: {dive_milliliters} milliliters")
-        self.syringe.move_syringe(dive_milliliters)
+        self.syringe.move(dive_milliliters)
         self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, ke, integral_bound)
         
         self.dive_milliliters = dive_milliliters
-        self.dive_start_time = time.ticks_ms()
-
-        self.dive_timer = Timer(1)
-        self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=self.pid_run)
+        self.dive_start_time = ticks_ms()
     
     def pid_run(self):
-        elapsed = time.ticks_diff(time.ticks_ms(), self.dive_start_time)
-        if elapsed < DIVE_TIME:
-            self.pid.run()
-        else:
-            self.dive_timer.deinit()
-            self.syringe.move_syringe(-self.dive_milliliters)
-            self.pid = None
+        self.syringe.update() 
+        if self.pid is not None:
+            self.elapsed = ticks_diff(ticks_ms(), self.dive_start_time)
+            if self.elapsed < DIVE_TIME:
+                self.pid.run()
+            else:
+                self.syringe.move(-self.dive_milliliters)
+                self.pid = None
 
-    # Parse request as request and a single argument
-    def parse_request(self, message):
-        request = None
-        argument = None
-        splits = message.split()
-        if len(splits) > 0:
-            request = splits[0]
-            if len(splits) > 1:
-                argument = splits[1]
-        return request, argument
+    def parse_request(self, buffer):
+        if len(buffer) < 1:
+            return None, None
+            
+        cmd_id = buffer[0]
+        
+        if cmd_id == CMD_DIVE and len(buffer) >= 8:
+            try:
+                _, dive_ml, kp_raw, ki_raw, kd_raw, ke, integral_bound = struct.unpack('>BBHHHBb', buffer[:8])
+                kp = kp_raw / 1000.0
+                ki = ki_raw / 1000.0  
+                kd = kd_raw / 1000.0
+                return 'd', [dive_ml, kp, ki, kd, ke, integral_bound]
+            except:
+                return None, None
+                
+        elif cmd_id == CMD_MOVE_FORWARD and len(buffer) >= 2:
+            try:
+                _, amount = struct.unpack('>BB', buffer[:2])
+                return 'f', amount
+            except:
+                return None, None
+                
+        elif cmd_id == CMD_MOVE_BACKWARD and len(buffer) >= 2:
+            try:
+                _, amount = struct.unpack('>BB', buffer[:2])
+                return 'b', amount
+            except:
+                return None, None
+        
+        return None, None
     
     def ble_irq(self, event, data):
         if event == _IRQ_CENTRAL_CONNECT:
@@ -220,21 +276,16 @@ class Bluetooth:
             self.advertiser()
             self.disconnect()
         elif event == _IRQ_GATTS_WRITE:
-            # New message received
             buffer = self.ble.gatts_read(self.rx)
-            message = buffer.decode('UTF-8').strip()
-            print(message)
-            command,argument = self.parse_request(message)
+            command, argument = self.parse_request(buffer)
                
             if command == 'd':
                 if(self.pid == None):
-                    self.dive(*list(map(int, argument.split(",")[:6])))
-                
-            if command == 'f':
-                self.syringe.move_syringe(int(argument))
-                
-            if command == 'b':
-                self.syringe.move_syringe(-int(argument))
+                    self.dive(*argument)
+            elif command == 'f':
+                self.syringe.move(argument)
+            elif command == 'b':
+                self.syringe.move(-argument)
            
     def register(self):        
         # Nordic UART Service (NUS)
@@ -251,8 +302,7 @@ class Bluetooth:
         ((self.tx, self.rx,), ) = self.ble.gatts_register_services(SERVICES)
 
     def advertiser(self):
-        name = bytes(self.name, 'UTF-8')
-        self.ble.gap_advertise(100, bytearray('\x02\x01\x02') + bytearray((len(name) + 1, 0x09)) + name)
+        self.ble.gap_advertise(100, bytearray(b'\x02\x01\x02') + bytearray([len(self.name) + 1, 0x09]) + self.name.encode('UTF-8'))
 
 class Float:
     def __init__(self):
@@ -264,6 +314,7 @@ try:
     print("Starting Float")
     float = Float()
     while True:
+        print(".")
         sleep(1)
 except KeyboardInterrupt:
     print("Keyboard Interrupt")
