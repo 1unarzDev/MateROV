@@ -5,8 +5,6 @@ from collections import deque
 import ubluetooth 
 from micropython import const # Optimize constants at runtime
 import struct
-import sys
-import select
 
 # Bluetooth
 _IRQ_CENTRAL_CONNECT = const(1)
@@ -16,6 +14,7 @@ _IRQ_PERIPHERAL_DISCONNECT = const(8)
 CMD_DIVE = const(0x01)
 CMD_MOVE_FORWARD = const(0x02)
 CMD_MOVE_BACKWARD = const(0x03)
+CMD_STOP = const(0x04)
 DATA_PRESSURE = const(0x50)
 DATA_PID = const(0x44)     
 
@@ -28,6 +27,7 @@ PRESSURE_SENSOR_PIN = const(3)
 # Servo
 SERVO_STOPPED = const(1.5) # ms
 SERVO_MOVE_RANGE = const(0.5) # ms
+EPSILON = const(3) # mL
 
 # Pressures sensor (depth)
 WATER_DENSITY = const(1000) # kg/m³
@@ -41,11 +41,10 @@ ATMOSPHERE_PRESSURE = const(101325) # Pa
 SECONDS_PER_ML = const(0.85)
 
 # PID
+PID_ENABLED = const(False)
 PID_CALLBACK_TIME = const(10) # ms
-FLOAT_VOLUME = const(600) # cm^3
-FLOAT_MASS = const(550) # g
-DIVE_TIME = const(45000) # ms
-DESIRED_DEPTH = const(2.5) # m
+DIVE_TIME = const(45000) # ms (45000 for task)
+DESIRED_DEPTH = const(2.5) # m (2.5 for task)
 
 # Continuous rotation servo which takes in input speeds (pulse widths in ms) rather than positional inputs
 class Servo:
@@ -59,28 +58,39 @@ class Servo:
     def stop(self):
         self.set_duty_ms(SERVO_STOPPED)
 
-    # -1 is backward the fastest and 1 is forward the fastest
+    # 1 is backward the fastest and -1 is forward the fastest
     def move(self, speed):
         duty_ms = (SERVO_STOPPED + max(-0.5, min(0.5, speed * SERVO_MOVE_RANGE)))
-        self.set_duty_ms(duty_ms)
+        self.set_duty_ms(-duty_ms)
         
 class Syringe:
     def __init__(self):
         self.servo = Servo()
-        self.active = False
+        self.pos = 0
+        self.goal_pos = 0
+        self.dt = 0
+        self.prev_t = time_ms()
         self.end_time = 0
+        self.movement = 0
 
     def move(self, ml):
-        direction = -ml / abs(ml)
-        self.servo.move(direction)
-        wait_ms = int(abs(ml) * SECONDS_PER_ML * 1000)
-        self.end_time = ticks_ms() + wait_ms
-        self.active = True
+        self.goal_pos = ml        
+        
+    def stop(self):
+        self.servo.stop()
 
     def update(self):
-        if self.active and ticks_diff(ticks_ms(), self.end_time) >= 0:
-            self.servo.stop()
-            self.active = False
+        self.t = time_ms()
+        self.dt = t - prev_t / 1000.0
+        self.prev_t = t
+        
+        self.pos += movement * SECONDS_PER_ML * dt
+
+        if(abs(self.goal_pos - self.pos) <= EPSILON):
+            self.stop()
+        else:
+            self.movement = abs(self.goal_pos - self.pos) / (self.goa_pos - self.pos)
+            self.servo.move(movement)
 
 class PressureSensor:
     def __init__(self):
@@ -89,36 +99,35 @@ class PressureSensor:
     
     def read_voltage(self):
         return max(0.5, self.sensor.read_uv() / 1e6)
-
-    def read_pressure(self):
-        voltage = self.read_voltage()
-        return MAX_PRESSURE_RATING * (voltage - MIN_PRESSURE_VOLTAGE) / (MAX_PRESSURE_VOLTAGE - MIN_PRESSURE_VOLTAGE)
     
     def read_depth(self):
-        pressure = max(0, self.read_pressure() - ATMOSPHERE_PRESSURE)
-        depth = pressure / (WATER_DENSITY * GRAVITY)
-        return depth
+        voltage = self.read_voltage()
+        return voltage * 6.953 - 3.107 # Linear regression since it is directly proportional
+
+    # Work backward from depth because we don't have a regression for it
+    def read_pressure(self):
+        depth = self.read_depth()    
+        pressure = depth * GRAVITY  * WATER_DENSITY + ATMOSPHERE_PRESSURE
+        return pressure
 
 class PID:
-    def __init__(self, pressure_sensor, syringe, kp, ki, kd, ke, integral_bound):
+    def __init__(self, pressure_sensor, syringe, kp, ki, kd, equilibrium, integral_bound):
         self.desired_depth = DESIRED_DEPTH
         self.kp = kp
         self.ki = ki
         self.kd = kd
-        self.ke = ke
+        self.equlibrium = equilibrium
         self.integral_bound = integral_bound
         self.pressure_sensor = pressure_sensor
         self.syringe = syringe
         self.prev_t = ticks_ms()
-        self.prev_error = FLOAT_VOLUME - FLOAT_MASS + ke * DESIRED_DEPTH
+        self.prev_error = DESIRED_DEPTH
         self.integral = 0
         self.dt = 0
         self.change_ml = 0
     
-    # Assumes water density of 1 g/cm^3 or 1 g/mL and uses some fancy logic to do with water displacement relative to diver volume and mass
     def error(self):
-        m = FLOAT_VOLUME - FLOAT_MASS + self.ke / 10 * DESIRED_DEPTH # Lazy manual addition of / 10
-        return m * (DESIRED_DEPTH - self.pressure_sensor.read_depth()) 
+        return DESIRED_DEPTH - self.pressure_sensor.read_depth() 
 
     def compute(self, error):
         self.t = ticks_ms()
@@ -130,16 +139,16 @@ class PID:
         derivative = (error - self.prev_error) / self.dt
         self.prev_error = error
 
-        ml = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
-        print(f"{error}, {self.integral}, {derivative}")
+        ml = self.equlibrium + (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
         return ml
     
     def run(self):
         self.change_ml = self.compute(self.error())
-        self.syringe.move(self.change_ml)
+        if(PID_ENABLED):
+            self.syringe.move(self.change_ml)
 
 class Bluetooth:
-    def __init__(self, name, pressure_sensor, syringe):   
+    def __init__(self, name, pressure_sensor, syringe):
         self.name = name
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
@@ -164,7 +173,7 @@ class Bluetooth:
         self.connected = True
         print("Connected")
 
-    def disconnect(self):        
+    def disconnect(self):
         self.connected = False
         print("Disconnected")
          
@@ -190,7 +199,7 @@ class Bluetooth:
         
         data = struct.pack('>BHfff', 
                           DATA_PRESSURE,
-                          self.elapsed,
+                          ticks_ms(),
                           voltage,      
                           pressure,     
                           depth)        
@@ -202,7 +211,7 @@ class Bluetooth:
         
         data = struct.pack('>BHff', 
                           DATA_PID,    
-                          self.elapsed,
+                          ticks_ms(),
                           error,       
                           moved_ml)  
         self.send(data)  
@@ -214,9 +223,9 @@ class Bluetooth:
                 self.send_pid_data()
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
-    def dive(self, dive_milliliters, kp, ki, kd, ke, integral_bound):
+    def dive(self, dive_milliliters, kp, ki, kd, equilibrium, integral_bound):
         self.syringe.move(dive_milliliters)
-        self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, ke, integral_bound)
+        self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, equilibrium, integral_bound)
         
         self.dive_milliliters = dive_milliliters
         self.dive_start_time = ticks_ms()
@@ -228,7 +237,7 @@ class Bluetooth:
             if self.elapsed < DIVE_TIME:
                 self.pid.run()
             else:
-                self.syringe.move(-self.dive_milliliters)
+                self.syringe.move(0)
                 self.pid = None
 
     def parse_request(self, buffer):
@@ -262,6 +271,12 @@ class Bluetooth:
             except:
                 return None, None
         
+        elif cmd_id == CMD_STOP:
+            try:
+                return 's', 0;
+            except:
+                return None, None
+
         return None, None
     
     def ble_irq(self, event, data):
@@ -288,6 +303,9 @@ class Bluetooth:
                 self.syringe.move(argument)
             elif command == 'b':
                 self.syringe.move(-argument)
+            elif command == 's':
+                self.pid = None
+                self.syringe.stop()
            
     def register(self):        
         # Nordic UART Service (NUS)

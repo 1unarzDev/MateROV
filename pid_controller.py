@@ -10,10 +10,10 @@ import struct
 KP = 0.8
 KI = 0.2
 KD = 0.4
-KE = 2
+EQULIBRIUM = 10
 INTEGRAL_BOUND = 10
 MOVE_INCREMENT = 5
-DIVE_ML = 5
+DIVE_ML = 10
 
 root = tkinter.Tk()
 root.wm_title("Diver Controller")
@@ -38,7 +38,7 @@ def update_line():
     ax = fig.add_subplot()
     ax.plot(list(row[0] for row in depths), list(row[1] for row in depths), label="Depth (m)")
     if errors:
-        ax.plot(list(row[0] for row in errors), list(row[1] for row in errors), label="Error")
+        ax.plot(list(row[0] for row in errors), list(row[1] for row in errors), label="Error (m)")
     if move_mls:
         ax.plot(list(row[0] for row in move_mls), list(row[1] for row in move_mls), label="Move mLs")
     ax.set_xlabel("Time (s)")
@@ -142,7 +142,7 @@ def dive():
                       int(KP * 1000),
                       int(KI * 1000), 
                       int(KD * 1000),
-                      KE,
+                      EQULIBRIUM,
                       INTEGRAL_BOUND)
     diver_com.send(data)
 
@@ -157,6 +157,10 @@ def forward():
 def backward():
     move(1, MOVE_INCREMENT)
 
+def stop():
+    data = struct.pack('>B', 0x04)
+    diver_com.send(data)
+
 def reset_graph():
     global base_time, depths, times, errors, move_mls
     base_time = None
@@ -169,6 +173,7 @@ def reset_graph():
 
 button_forward = tkinter.Button(master=root, text=f"Down {MOVE_INCREMENT} mL", command=forward)
 button_backward = tkinter.Button(master=root, text=f"Up {MOVE_INCREMENT} mL", command=backward)
+button_stop = tkinter.Button(master=root, text=f"Stop", command=stop)
 button_quit = tkinter.Button(master=root, text="Quit", command=root.destroy)
 button_dive = tkinter.Button(master=root, text="Dive", command=dive)
 button_reset = tkinter.Button(master=root, text="Reset Graph", command=reset_graph)
@@ -184,6 +189,7 @@ button_reset.pack(side=tkinter.LEFT)
 label_connected.pack(side=tkinter.LEFT)
 button_forward.pack(side=tkinter.RIGHT)
 button_backward.pack(side=tkinter.RIGHT)
+button_stop.pack(side=tkinter.RIGHT)
 
 def com_connected():
     label_connected.config(text="Connected", bg="green", fg="white")
