@@ -8,10 +8,10 @@ import com
 import struct
 
 KP = 0.8
-KI = 0.02
-KD = 0.1
-KE = 5
-INTEGRAL_BOUND = 3
+KI = 0.2
+KD = 0.4
+KE = 2
+INTEGRAL_BOUND = 10
 MOVE_INCREMENT = 5
 DIVE_ML = 5
 
@@ -21,7 +21,6 @@ root.wm_title("Diver Controller")
 inbound_queue = queue.Queue()
 
 fig = Figure(figsize=(5, 4), dpi=100)
-times = []
 base_time = None
 depths = []
 errors = []
@@ -37,11 +36,11 @@ def update_line():
     if ax is not None:
         fig.delaxes(ax)
     ax = fig.add_subplot()
-    ax.plot(times, depths, label="Depth (m)")
+    ax.plot(list(row[0] for row in depths), list(row[1] for row in depths), label="Depth (m)")
     if errors:
-        ax.plot(times[:len(errors)], errors, label="Error")
+        ax.plot(list(row[0] for row in errors), list(row[1] for row in errors), label="Error")
     if move_mls:
-        ax.plot(times[:len(move_mls)], move_mls, label="Move mL")
+        ax.plot(list(row[0] for row in move_mls), list(row[1] for row in move_mls), label="Move mLs")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Values")
     ax.legend()
@@ -85,7 +84,6 @@ def parse_binary_data(data):
 def handle_pressure_data(data):
     global base_time
     
-    latest_pressure_data = data
     t = int(data['timestamp'])
     voltage = data['voltage']
     pressure = data['pressure']
@@ -94,8 +92,8 @@ def handle_pressure_data(data):
     if base_time is None:
         base_time = t
     
-    times.append((t - base_time) / 1000)
-    depths.append(depth)
+    point = [(t - base_time) / 1000, depth]
+    depths.append(point)
     
     log_msg = f"Pressure - Time: {t}, Voltage: {voltage:.2f} V, Pressure: {pressure:.1f} Pa, Depth: {depth:.2f} m"
     print(log_msg)
@@ -107,17 +105,11 @@ def handle_pid_data(data):
     error = data['error']
     moved_ml = data['moved_ml']
     
-    if len(errors) < len(times):
-        errors.extend([0] * (len(times) - len(errors)))
-    if len(move_mls) < len(times):
-        move_mls.extend([0] * (len(times) - len(move_mls)))
-    
-    if len(errors) == len(times):
-        errors.append(error)
-        move_mls.append(moved_ml)
-    else:
-        errors[-1] = error
-        move_mls[-1] = moved_ml
+    point = [(t - base_time) / 1000, error]
+    errors.append(point)
+
+    point = [(t - base_time) / 1000, moved_ml]
+    move_mls.append(point)
     
     log_msg = f"PID - Time: {t}, Error: {error:.3f}, Moved: {moved_ml:.3f} mL"
     print(log_msg)

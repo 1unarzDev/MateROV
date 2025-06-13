@@ -110,19 +110,19 @@ class PID:
         self.pressure_sensor = pressure_sensor
         self.syringe = syringe
         self.prev_t = ticks_ms()
-        self.prev_error = 0
+        self.prev_error = FLOAT_VOLUME - FLOAT_MASS + ke * DESIRED_DEPTH
         self.integral = 0
         self.dt = 0
         self.change_ml = 0
     
-    # Assumes water density of 1 g/cm^3 or 1 g/mL and uses some fancy logic to do with water displacement relative to float volume and mass
+    # Assumes water density of 1 g/cm^3 or 1 g/mL and uses some fancy logic to do with water displacement relative to diver volume and mass
     def error(self):
-        m = FLOAT_VOLUME - FLOAT_MASS + self.ke * DESIRED_DEPTH
+        m = FLOAT_VOLUME - FLOAT_MASS + self.ke / 10 * DESIRED_DEPTH # Lazy manual addition of / 10
         return m * (DESIRED_DEPTH - self.pressure_sensor.read_depth()) 
 
     def compute(self, error):
         self.t = ticks_ms()
-        self.dt = ticks_diff(self.t, self.prev_t) / 1000
+        self.dt = ticks_diff(self.t, self.prev_t) / 1000.0
         self.prev_t = self.t
 
         self.integral += error * self.dt
@@ -131,6 +131,7 @@ class PID:
         self.prev_error = error
 
         ml = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        print(f"{error}, {self.integral}, {derivative}")
         return ml
     
     def run(self):
@@ -203,7 +204,7 @@ class Bluetooth:
                           DATA_PID,    
                           self.elapsed,
                           error,       
-                          moved_ml)    
+                          moved_ml)  
         self.send(data)  
         
     def send_data(self):
@@ -214,7 +215,6 @@ class Bluetooth:
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
     def dive(self, dive_milliliters, kp, ki, kd, ke, integral_bound):
-        self.send(f"Diving for: {dive_milliliters} milliliters")
         self.syringe.move(dive_milliliters)
         self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, ke, integral_bound)
         
@@ -224,7 +224,7 @@ class Bluetooth:
     def pid_run(self):
         self.syringe.update() 
         if self.pid is not None:
-            self.elapsed = ticks_diff(ticks_ms(), self.dive_start_time)
+            self.elapsed = ticks_ms() - self.dive_start_time
             if self.elapsed < DIVE_TIME:
                 self.pid.run()
             else:
@@ -234,8 +234,6 @@ class Bluetooth:
     def parse_request(self, buffer):
         if len(buffer) < 1:
             return None, None
-            
-        print(f"Buffer: {buffer}, Len: {len(buffer)}, CMD: {buffer[0]}")
 
         cmd_id = buffer[0]
         
@@ -308,7 +306,7 @@ class Bluetooth:
     def advertiser(self):
         self.ble.gap_advertise(100, bytearray(b'\x02\x01\x02') + bytearray([len(self.name) + 1, 0x09]) + self.name.encode('UTF-8'))
 
-class Float:
+class Diver:
     def __init__(self):
         self.pressure_sensor = PressureSensor()
         self.syringe = Syringe()
@@ -316,11 +314,10 @@ class Float:
 
 try:
     if SAFE_MODE_PIN.value() == 1:
-        print("Starting Float")
-        float = Float()
+        print("Starting Diver")
+        diver = Diver()
         while True:
-            if not float.bluetooth.connected:
-                print(".")
+            print(".")
             sleep(1)
     else:
         print("Safety Pin Activated, Quitting...")
