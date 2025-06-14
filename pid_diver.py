@@ -21,13 +21,14 @@ DATA_PID = const(0x44)
 # General
 LOG_TIME = const(1000) # ms
 SAFE_MODE_PIN = Pin(10, Pin.IN, Pin.PULL_UP)
+POSITION_FEEDBACK_PIN = const(1)
 SERVO_PIN = const(2)
 PRESSURE_SENSOR_PIN = const(3)
 
 # Servo
 SERVO_STOPPED = const(1.5) # ms
 SERVO_MOVE_RANGE = const(0.5) # ms
-EPSILON = const(3) # mL
+EPSILON = const(0.3) # mL
 
 # Pressures sensor (depth)
 WATER_DENSITY = const(1000) # kg/m³
@@ -36,13 +37,14 @@ MIN_PRESSURE_VOLTAGE = const(0.5) # V
 MAX_PRESSURE_VOLTAGE = const(4.5) # V
 MAX_PRESSURE_RATING = const(206843) # Pa
 ATMOSPHERE_PRESSURE = const(101325) # Pa
+SMOOTHING_WINDOW = const(8)
 
 # Syringe
-SECONDS_PER_ML = const(0.85)
+SECONDS_PER_ML = const(0.6)
 
 # PID
-PID_ENABLED = const(False)
-PID_CALLBACK_TIME = const(10) # ms
+PID_ENABLED = const(True)
+PID_CALLBACK_TIME = const(200) # ms
 DIVE_TIME = const(45000) # ms (45000 for task)
 DESIRED_DEPTH = const(2.5) # m (2.5 for task)
 
@@ -51,6 +53,8 @@ class Servo:
     def __init__(self):
         self.pwm = PWM(Pin(SERVO_PIN))
         self.pwm.freq(50)
+        self.position_sensor = ADC(Pin(POSITION_FEEDBACK_PIN))
+        self.position_sensor.atten(ADC.ATTN_11DB)
 
     def set_duty_ms(self, ms):
         self.pwm.duty_ns(int(ms * 1e6))
@@ -61,7 +65,7 @@ class Servo:
     # 1 is backward the fastest and -1 is forward the fastest
     def move(self, speed):
         duty_ms = (SERVO_STOPPED + max(-0.5, min(0.5, speed * SERVO_MOVE_RANGE)))
-        self.set_duty_ms(-duty_ms)
+        self.set_duty_ms(duty_ms)
         
 class Syringe:
     def __init__(self):
@@ -69,7 +73,7 @@ class Syringe:
         self.pos = 0
         self.goal_pos = 0
         self.dt = 0
-        self.prev_t = time_ms()
+        self.prev_t = ticks_ms()
         self.end_time = 0
         self.movement = 0
 
@@ -77,32 +81,39 @@ class Syringe:
         self.goal_pos = ml        
         
     def stop(self):
+        self.goal_pos = self.pos
+        self.movement = 0
         self.servo.stop()
 
     def update(self):
-        self.t = time_ms()
-        self.dt = t - prev_t / 1000.0
-        self.prev_t = t
-        
-        self.pos += movement * SECONDS_PER_ML * dt
+        self.t = ticks_ms()
+        self.dt = ticks_diff(self.t, self.prev_t) / 1000.0
+        self.prev_t = self.t
+
+        self.pos += self.movement * self.dt / SECONDS_PER_ML 
 
         if(abs(self.goal_pos - self.pos) <= EPSILON):
             self.stop()
         else:
-            self.movement = abs(self.goal_pos - self.pos) / (self.goa_pos - self.pos)
-            self.servo.move(movement)
+            self.movement = 1 if self.goal_pos > self.pos else -1
+            self.servo.move(self.movement)
+            
+        # print(f"{self.pos}, {self.goal_pos}, {self.dt}")
 
 class PressureSensor:
     def __init__(self):
         self.sensor = ADC(Pin(PRESSURE_SENSOR_PIN))
         self.sensor.atten(ADC.ATTN_11DB)
+        self.depth_buffer = deque((), SMOOTHING_WINDOW)
     
     def read_voltage(self):
         return max(0.5, self.sensor.read_uv() / 1e6)
     
     def read_depth(self):
         voltage = self.read_voltage()
-        return voltage * 6.953 - 3.107 # Linear regression since it is directly proportional
+        raw_depth = voltage * 6.953 - 3.107 # Linear regression since it is directly proportional
+        self.depth_buffer.append(raw_depth)
+        return sum(self.depth_buffer) / len(self.depth_buffer)
 
     # Work backward from depth because we don't have a regression for it
     def read_pressure(self):
@@ -123,8 +134,8 @@ class PID:
         self.prev_t = ticks_ms()
         self.prev_error = DESIRED_DEPTH
         self.integral = 0
+        self.derivative = 0
         self.dt = 0
-        self.change_ml = 0
     
     def error(self):
         return DESIRED_DEPTH - self.pressure_sensor.read_depth() 
@@ -136,16 +147,17 @@ class PID:
 
         self.integral += error * self.dt
         self.integral = max(-self.integral_bound, min(self.integral, self.integral_bound))
-        derivative = (error - self.prev_error) / self.dt
+        self.derivative = (error - self.prev_error) / self.dt
+
         self.prev_error = error
 
-        ml = self.equlibrium + (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        ml = self.equlibrium + (self.kp * error) + (self.ki * self.integral) + (self.kd * self.derivative)
         return ml
     
     def run(self):
-        self.change_ml = self.compute(self.error())
+        change_ml = self.compute(self.error())
         if(PID_ENABLED):
-            self.syringe.move(self.change_ml)
+            self.syringe.move(change_ml)
 
 class Bluetooth:
     def __init__(self, name, pressure_sensor, syringe):
@@ -153,7 +165,7 @@ class Bluetooth:
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
         self.connHandle = 0
-        self.queue = deque((), int(DIVE_TIME / LOG_TIME * 2))
+        self.queue = deque((), int(DIVE_TIME / LOG_TIME * 3))
         self.connected = False
         self.disconnect()
         self.ble.irq(self.ble_irq)
@@ -165,7 +177,7 @@ class Bluetooth:
         self.timer = Timer(0)
         self.timer.init(period=LOG_TIME, mode=Timer.PERIODIC, callback=lambda t: self.send_data())
         self.dive_timer = Timer(1)
-        self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=lambda t: self.pid_run())
+        self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=lambda t: self.run())
         self.elapsed = 0
 
     def connect(self, data):
@@ -178,17 +190,18 @@ class Bluetooth:
         print("Disconnected")
          
     def send_queued(self):
-        while self.connected:
+        if self.connected:
             try:
                 data = self.queue.popleft()
                 self.ble.gatts_write(self.tx, data, True)
-            except:
-                return
+            except IndexError:
+                pass
+            except Exception as e:
+                print(f"BLE send error: {e}")
      
     def send(self, data):
         try:
             self.queue.append(data)
-            self.send_queued()
         except:
             return
 
@@ -207,13 +220,12 @@ class Bluetooth:
 
     def send_pid_data(self):
         error = self.pid.error()
-        moved_ml = self.pid.change_ml
-        
-        data = struct.pack('>BHff', 
+        data = struct.pack('>BHfff', 
                           DATA_PID,    
                           ticks_ms(),
-                          error,       
-                          moved_ml)  
+                          error * self.pid.kp,
+                          self.pid.integral * self.pid.ki,
+                          self.pid.derivative * self.pid.kd)  
         self.send(data)  
         
     def send_data(self):
@@ -224,20 +236,22 @@ class Bluetooth:
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
     def dive(self, dive_milliliters, kp, ki, kd, equilibrium, integral_bound):
+        self.syringe.pos = 0
         self.syringe.move(dive_milliliters)
         self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, equilibrium, integral_bound)
         
         self.dive_milliliters = dive_milliliters
         self.dive_start_time = ticks_ms()
     
-    def pid_run(self):
+    def run(self):
+        self.send_queued()
         self.syringe.update() 
         if self.pid is not None:
             self.elapsed = ticks_ms() - self.dive_start_time
             if self.elapsed < DIVE_TIME:
                 self.pid.run()
             else:
-                self.syringe.move(0)
+                self.syringe.move(5)
                 self.pid = None
 
     def parse_request(self, buffer):
@@ -300,9 +314,9 @@ class Bluetooth:
                 if(self.pid == None):
                     self.dive(*argument)
             elif command == 'f':
-                self.syringe.move(argument)
+                self.syringe.move(self.syringe.pos - argument)
             elif command == 'b':
-                self.syringe.move(-argument)
+                self.syringe.move(self.syringe.pos + argument)
             elif command == 's':
                 self.pid = None
                 self.syringe.stop()

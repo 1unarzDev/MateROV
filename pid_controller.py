@@ -6,12 +6,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import asyncio
 import com
 import struct
+import os
+from datetime import datetime
 
 KP = 0.8
-KI = 0.2
+KI = 0.01
 KD = 0.4
 EQULIBRIUM = 10
-INTEGRAL_BOUND = 10
+INTEGRAL_BOUND = 100
 MOVE_INCREMENT = 5
 DIVE_ML = 10
 
@@ -23,13 +25,33 @@ inbound_queue = queue.Queue()
 fig = Figure(figsize=(5, 4), dpi=100)
 base_time = None
 depths = []
-errors = []
-move_mls = []
+proportionals = []
+integrals = []
+derivatives = []
 ax = None
 diver_com = com.DiverCom("DemonDiver")
 
 canvas = FigureCanvasTkAgg(fig, master=root)
 canvas.draw()
+
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+
+def get_next_log_filename():
+    log_number = 1
+    while os.path.exists(f"logs/diverLog_{log_number:03d}.txt"):
+        log_number += 1
+    return f"logs/diverLog_{log_number:03d}.txt"
+
+current_log_file = get_next_log_filename()
+
+with open(current_log_file, "w") as f:
+    f.write(f"Diver Log Session Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Parameters - KP: {KP}, KI: {KI}, KD: {KD}, Equilibrium: {EQULIBRIUM}, Integral Bound: {INTEGRAL_BOUND}\n")
+    f.write("-" * 80 + "\n")
+
+def ticks_diff(end, start):
+    return (end - start) & 0xFFFFFFFF
 
 def update_line():
     global ax
@@ -37,10 +59,12 @@ def update_line():
         fig.delaxes(ax)
     ax = fig.add_subplot()
     ax.plot(list(row[0] for row in depths), list(row[1] for row in depths), label="Depth (m)")
-    if errors:
-        ax.plot(list(row[0] for row in errors), list(row[1] for row in errors), label="Error (m)")
-    if move_mls:
-        ax.plot(list(row[0] for row in move_mls), list(row[1] for row in move_mls), label="Move mLs")
+    if proportionals:
+        ax.plot(list(row[0] for row in proportionals), list(row[1] for row in proportionals), label="Proportional")
+    if integrals:
+        ax.plot(list(row[0] for row in integrals), list(row[1] for row in integrals), label="Integral")
+    if derivatives:
+        ax.plot(list(row[0] for row in derivatives), list(row[1] for row in derivatives), label="Derivative")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Values")
     ax.legend()
@@ -67,14 +91,15 @@ def parse_binary_data(data):
                 pass
                 
     elif packet_type == 0x44:  
-        if len(data) >= 11:
+        if len(data) >= 15:
             try:
-                _, timestamp, error, moved_ml = struct.unpack('>BHff', data[:11])
+                _, timestamp, proportional, integral, derivative = struct.unpack('>BHfff', data[:15])
                 return {
                     'type': 'pid',
                     'timestamp': timestamp,
-                    'error': error,
-                    'moved_ml': moved_ml
+                    'proportional': proportional,
+                    'integral': integral,
+                    'derivative': derivative,
                 }
             except struct.error:
                 pass
@@ -92,28 +117,41 @@ def handle_pressure_data(data):
     if base_time is None:
         base_time = t
     
-    point = [(t - base_time) / 1000, depth]
+    curr_time = ticks_diff(t, base_time) / 1000
+
+    point = [curr_time, depth]
     depths.append(point)
     
     log_msg = f"Pressure - Time: {t}, Voltage: {voltage:.2f} V, Pressure: {pressure:.1f} Pa, Depth: {depth:.2f} m"
     print(log_msg)
-    with open("diverLog.txt", "a") as f:
+    with open(current_log_file, "a") as f:
         f.write(log_msg + "\n")
 
 def handle_pid_data(data):
-    t = int(data['timestamp'])
-    error = data['error']
-    moved_ml = data['moved_ml']
-    
-    point = [(t - base_time) / 1000, error]
-    errors.append(point)
+    global base_time
 
-    point = [(t - base_time) / 1000, moved_ml]
-    move_mls.append(point)
+    t = int(data['timestamp'])
+    proportional = data['proportional']
+    integral = data['integral']
+    derivative = data['derivative']
     
-    log_msg = f"PID - Time: {t}, Error: {error:.3f}, Moved: {moved_ml:.3f} mL"
+    if base_time is None:
+        base_time = t
+
+    curr_time = ticks_diff(t, base_time) / 1000
+
+    point = [curr_time, proportional]
+    proportionals.append(point)
+
+    point = [curr_time, integral]
+    integrals.append(point)
+
+    point = [curr_time, derivative]
+    derivatives.append(point)
+
+    log_msg = f"PID - Time: {t}, P: {proportional:.2f}, I: {integral:.2f}, D: {derivative:.2f}"
     print(log_msg)
-    with open("diverLog.txt", "a") as f:
+    with open(current_log_file, "a") as f:
         f.write(log_msg + "\n")
 
 def handle_data_message(msg):
@@ -162,12 +200,13 @@ def stop():
     diver_com.send(data)
 
 def reset_graph():
-    global base_time, depths, times, errors, move_mls
+    global base_time, depths, times, proportionals, integrals, derivatives
     base_time = None
     depths = []
     times = []
-    errors = []
-    move_mls = []
+    proportionals = []
+    integrals = []
+    derivatives = []
     update_line()
     print("Graph Reset")
 
