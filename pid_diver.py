@@ -15,6 +15,7 @@ CMD_DIVE = const(0x01)
 CMD_MOVE_FORWARD = const(0x02)
 CMD_MOVE_BACKWARD = const(0x03)
 CMD_STOP = const(0x04)
+CMD_UPDATE_PARAMS = const(0x05)
 DATA_PRESSURE = const(0x50)
 DATA_PID = const(0x44)     
 
@@ -39,13 +40,9 @@ MAX_PRESSURE_RATING = const(206843) # Pa
 ATMOSPHERE_PRESSURE = const(101325) # Pa
 SMOOTHING_WINDOW = const(8)
 
-# Syringe
-SECONDS_PER_ML = const(0.6)
-
 # PID
 PID_ENABLED = const(True)
 PID_CALLBACK_TIME = const(200) # ms
-DIVE_TIME = const(45000) # ms (45000 for task)
 DESIRED_DEPTH = const(2.5) # m (2.5 for task)
 
 # Continuous rotation servo which takes in input speeds (pulse widths in ms) rather than positional inputs
@@ -76,6 +73,10 @@ class Syringe:
         self.prev_t = ticks_ms()
         self.end_time = 0
         self.movement = 0
+        self.seconds_per_ml = 1
+
+    def update_seconds_per_ml(self, seconds_per_ml):
+        self.seconds_per_ml = seconds_per_ml
 
     def move(self, ml):
         self.goal_pos = ml        
@@ -90,7 +91,7 @@ class Syringe:
         self.dt = ticks_diff(self.t, self.prev_t) / 1000.0
         self.prev_t = self.t
 
-        self.pos += self.movement * self.dt / SECONDS_PER_ML 
+        self.pos += self.movement * self.dt / self.seconds_per_ml
 
         if(abs(self.goal_pos - self.pos) <= EPSILON):
             self.stop()
@@ -165,7 +166,8 @@ class Bluetooth:
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
         self.connHandle = 0
-        self.queue = deque((), int(DIVE_TIME / LOG_TIME * 3))
+        self.dive_time = 45000 # (ms) Default
+        self.queue = deque((), int(self.dive_time / LOG_TIME * 3))
         self.connected = False
         self.disconnect()
         self.ble.irq(self.ble_irq)
@@ -179,6 +181,13 @@ class Bluetooth:
         self.dive_timer = Timer(1)
         self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=lambda t: self.run())
         self.elapsed = 0
+
+    def update_dive_time(self, dive_time):
+        self.dive_time = dive_time
+
+    def update_params(self, dive_time, seconds_per_ml):
+        update_dive_time(dive_time)
+        self.syringe.update_seconds_per_ml(seconds_per_ml)
 
     def connect(self, data):
         self.connHandle = data[0]
@@ -248,7 +257,7 @@ class Bluetooth:
         self.syringe.update() 
         if self.pid is not None:
             self.elapsed = ticks_ms() - self.dive_start_time
-            if self.elapsed < DIVE_TIME:
+            if self.elapsed < self.dive_time:
                 self.pid.run()
             else:
                 self.syringe.move(5)
@@ -270,6 +279,11 @@ class Bluetooth:
             except:
                 print("Failed to unpack dive")
                 return None, None
+            
+        elif cmd_id == CMD_UPDATE_PARAMS and len(buffer) >= 9:
+            try:
+                _, dive_time, seconds_per_ml = struct.unpack('>Bff', buffer[:9])
+                return 'u', [dive_time, seconds_per_ml]
                 
         elif cmd_id == CMD_MOVE_FORWARD and len(buffer) >= 2:
             try:
@@ -317,6 +331,8 @@ class Bluetooth:
                 self.syringe.move(self.syringe.pos - argument)
             elif command == 'b':
                 self.syringe.move(self.syringe.pos + argument)
+            elif command == 'u':
+                self.update_params(*argument)
             elif command == 's':
                 self.pid = None
                 self.syringe.stop()

@@ -188,6 +188,10 @@ def move(direction, amount):
     cmd = 0x02 if direction == 0 else 0x03
     data = struct.pack('>BB', cmd, int(abs(amount)))
     diver_com.send(data)
+    
+def update_params(dive_time, seconds_per_ml):
+    data = struct.pack('>Bff', 0x05, dive_time, seconds_per_ml)
+    diver_com.send(data)
 
 def forward():
     move(0, MOVE_INCREMENT)
@@ -220,6 +224,23 @@ button_reset = tkinter.Button(master=root, text="Reset Graph", command=reset_gra
 label_connected = tkinter.Label(master=root, text="Not Connected", bg="red", fg="white")
 label_message = tkinter.Label(master=root, width=40)
 
+label_dive_time = tkinter.Label(master=root, text="Dive Time (s):")
+entry_dive_time = tkinter.Entry(master=root)
+entry_dive_time.insert(0, "5.0")  # Default value
+
+label_seconds_per_ml = tkinter.Label(master=root, text="Seconds per mL:")
+entry_seconds_per_ml = tkinter.Entry(master=root)
+entry_seconds_per_ml.insert(0, "0.3")  # Default value
+
+def on_update_params():
+    try:
+        dive_time = float(entry_dive_time.get())
+        seconds_per_ml = float(entry_seconds_per_ml.get())
+        update_params(dive_time, seconds_per_ml)
+        label_message.config(text=f"Sent: dive_time={dive_time}, sec_per_ml={seconds_per_ml}")
+    except ValueError:
+        label_message.config(text="Invalid input! Use numbers.")
+
 label_message.pack(side=tkinter.BOTTOM, fill=tkinter.X)
 canvas.get_tk_widget().pack(side=tkinter.TOP, fill=tkinter.BOTH, expand=True)
 button_quit.pack(side=tkinter.RIGHT)
@@ -229,6 +250,15 @@ label_connected.pack(side=tkinter.LEFT)
 button_forward.pack(side=tkinter.RIGHT)
 button_backward.pack(side=tkinter.RIGHT)
 button_stop.pack(side=tkinter.RIGHT)
+
+label_dive_time.pack(side=tkinter.LEFT)
+entry_dive_time.pack(side=tkinter.LEFT)
+
+label_seconds_per_ml.pack(side=tkinter.LEFT)
+entry_seconds_per_ml.pack(side=tkinter.LEFT)
+
+button_update_params = tkinter.Button(master=root, text="Update Params", command=on_update_params)
+button_update_params.pack(side=tkinter.LEFT)
 
 def com_connected():
     label_connected.config(text="Connected", bg="green", fg="white")
