@@ -16,6 +16,7 @@ EQULIBRIUM = 40 # mL
 INTEGRAL_BOUND = 100
 MOVE_INCREMENT = 5 # mL
 DIVE_TIME = 45000 # ms
+DESIRED_DEPTH = 2.5 # m
 
 root = tkinter.Tk()
 root.wm_title("Diver Controller")
@@ -174,14 +175,15 @@ def handle_message():
     root.after(100, handle_message)
     
 def dive():
-    data = struct.pack('>BHHHHBb', 
+    data = struct.pack('>BHHHHBbH', 
                       0x01,  # Command ID for dive
                       DIVE_TIME,
                       int(KP * 1000),
                       int(KI * 1000), 
                       int(KD * 1000),
                       EQULIBRIUM,
-                      INTEGRAL_BOUND)
+                      INTEGRAL_BOUND,
+                      int(DESIRED_DEPTH * 1000))
     diver_com.send(data)
 
 def move(direction, amount):
