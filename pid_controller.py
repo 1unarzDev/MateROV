@@ -12,10 +12,10 @@ from datetime import datetime
 KP = 0.8
 KI = 0.01
 KD = 0.4
-EQULIBRIUM = 40
+EQULIBRIUM = 40 # mL
 INTEGRAL_BOUND = 100
-MOVE_INCREMENT = 5
-DIVE_ML = 40
+MOVE_INCREMENT = 5 # mL
+DIVE_TIME = 45000 # ms
 
 root = tkinter.Tk()
 root.wm_title("Diver Controller")
@@ -174,9 +174,9 @@ def handle_message():
     root.after(100, handle_message)
     
 def dive():
-    data = struct.pack('>BBHHHBb', 
+    data = struct.pack('>BHHHHBb', 
                       0x01,  # Command ID for dive
-                      DIVE_ML,
+                      DIVE_TIME,
                       int(KP * 1000),
                       int(KI * 1000), 
                       int(KD * 1000),

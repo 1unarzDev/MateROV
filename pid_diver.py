@@ -161,7 +161,6 @@ class Bluetooth:
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
         self.connHandle = 0
-        self.dive_time = 45000
         self.queue = deque((), int(45000 / LOG_TIME * 3))
         self.connected = False
         self.disconnect()
@@ -178,9 +177,6 @@ class Bluetooth:
         self.elapsed = 0
         self.desired_depth = 2.5
         self.safety = 10
-    
-    def update_dive_time(self, dive_time):
-        self.dive_time = dive_time
 
     def update_desired_depth(self, desired_depth):
         self.desired_depth = desired_depth
@@ -243,9 +239,10 @@ class Bluetooth:
                 self.send_pid_data()
         
     # First tries to reach the approximate depth by moving the syringe by a fixed amount then runs PID for the time that the diver must stay in place
-    def dive(self, dive_milliliters, kp, ki, kd, equilibrium, integral_bound):
+    def dive(self, dive_time, kp, ki, kd, equilibrium, integral_bound):
         self.syringe.pos = 0
-        self.syringe.move(dive_milliliters)
+        self.syringe.move(equilibrium)
+        self.dive_time = dive_time
         self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, equilibrium, integral_bound, self.desired_depth)
         
         self.dive_milliliters = dive_milliliters
@@ -270,11 +267,11 @@ class Bluetooth:
         
         if cmd_id == CMD_DIVE and len(buffer) >= 10:
             try:
-                _, dive_ml, kp_raw, ki_raw, kd_raw, ke, integral_bound = struct.unpack('>BBHHHBb', buffer[:10])
+                _, dive_time, kp_raw, ki_raw, kd_raw, equilibrium, integral_bound = struct.unpack('>BHHHHBb', buffer[:10])
                 kp = kp_raw / 1000.0
                 ki = ki_raw / 1000.0  
                 kd = kd_raw / 1000.0
-                return 'd', [dive_ml, kp, ki, kd, ke, integral_bound]
+                return 'd', [dive_time, kp, ki, kd, equilibrium, integral_bound]
             except:
                 return None, None
                 
@@ -286,13 +283,6 @@ class Bluetooth:
                 return None, None
                 
         elif cmd_id == CMD_MOVE_BACKWARD and len(buffer) >= 2:
-            try:
-                _, amount = struct.unpack('>BB', buffer[:2])
-                return 'b', amount
-            except:
-                return None, None
-        
-        elif cmd_id == CMD_UPDATE_PARAMETERS and len(buffer) >= 2:
             try:
                 _, amount = struct.unpack('>BB', buffer[:2])
                 return 'b', amount
