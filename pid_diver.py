@@ -234,7 +234,6 @@ class Bluetooth:
         self.dive_time = dive_time
         self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, equilibrium, integral_bound, desired_depth)
         
-        self.dive_milliliters = dive_milliliters
         self.dive_start_time = ticks_ms()
     
     def run(self):
