@@ -12,10 +12,10 @@ from datetime import datetime
 KP = 0.8
 KI = 0.01
 KD = 0.4
-EQULIBRIUM = 10
+EQULIBRIUM = 40
 INTEGRAL_BOUND = 100
 MOVE_INCREMENT = 5
-DIVE_ML = 10
+DIVE_ML = 40
 
 root = tkinter.Tk()
 root.wm_title("Diver Controller")

@@ -15,6 +15,7 @@ CMD_DIVE = const(0x01)
 CMD_MOVE_FORWARD = const(0x02)
 CMD_MOVE_BACKWARD = const(0x03)
 CMD_STOP = const(0x04)
+CMD_UPDATE_PARAMETERS = const(0x05)
 DATA_PRESSURE = const(0x50)
 DATA_PID = const(0x44)     
 
@@ -39,14 +40,8 @@ MAX_PRESSURE_RATING = const(206843) # Pa
 ATMOSPHERE_PRESSURE = const(101325) # Pa
 SMOOTHING_WINDOW = const(8)
 
-# Syringe
-SECONDS_PER_ML = const(0.6)
-
 # PID
-PID_ENABLED = const(True)
 PID_CALLBACK_TIME = const(200) # ms
-DIVE_TIME = const(45000) # ms (45000 for task)
-DESIRED_DEPTH = const(2.5) # m (2.5 for task)
 
 # Continuous rotation servo which takes in input speeds (pulse widths in ms) rather than positional inputs
 class Servo:
@@ -74,8 +69,12 @@ class Syringe:
         self.goal_pos = 0
         self.dt = 0
         self.prev_t = ticks_ms()
+        self.seconds_per_ml = 0.6
         self.end_time = 0
         self.movement = 0
+
+    def update_seconds_per_ml(self, seconds_per_ml):
+        self.seconds_per_ml = seconds_per_ml
 
     def move(self, ml):
         self.goal_pos = ml        
@@ -90,15 +89,13 @@ class Syringe:
         self.dt = ticks_diff(self.t, self.prev_t) / 1000.0
         self.prev_t = self.t
 
-        self.pos += self.movement * self.dt / SECONDS_PER_ML 
+        self.pos += self.movement * self.dt / self.seconds_per_ml 
 
         if(abs(self.goal_pos - self.pos) <= EPSILON):
             self.stop()
         else:
             self.movement = 1 if self.goal_pos > self.pos else -1
             self.servo.move(self.movement)
-            
-        # print(f"{self.pos}, {self.goal_pos}, {self.dt}")
 
 class PressureSensor:
     def __init__(self):
@@ -122,8 +119,8 @@ class PressureSensor:
         return pressure
 
 class PID:
-    def __init__(self, pressure_sensor, syringe, kp, ki, kd, equilibrium, integral_bound):
-        self.desired_depth = DESIRED_DEPTH
+    def __init__(self, pressure_sensor, syringe, kp, ki, kd, equilibrium, integral_bound, desired_depth):
+        self.desired_depth = desired_depth
         self.kp = kp
         self.ki = ki
         self.kd = kd
@@ -132,13 +129,13 @@ class PID:
         self.pressure_sensor = pressure_sensor
         self.syringe = syringe
         self.prev_t = ticks_ms()
-        self.prev_error = DESIRED_DEPTH
+        self.prev_error = desired_depth
         self.integral = 0
         self.derivative = 0
         self.dt = 0
     
     def error(self):
-        return DESIRED_DEPTH - self.pressure_sensor.read_depth() 
+        return self.desired_depth - self.pressure_sensor.read_depth() 
 
     def compute(self, error):
         self.t = ticks_ms()
@@ -156,8 +153,7 @@ class PID:
     
     def run(self):
         change_ml = self.compute(self.error())
-        if(PID_ENABLED):
-            self.syringe.move(change_ml)
+        self.syringe.move(change_ml)
 
 class Bluetooth:
     def __init__(self, name, pressure_sensor, syringe):
@@ -165,7 +161,8 @@ class Bluetooth:
         self.ble = ubluetooth.BLE()
         self.ble.active(True)
         self.connHandle = 0
-        self.queue = deque((), int(DIVE_TIME / LOG_TIME * 3))
+        self.dive_time = 45000
+        self.queue = deque((), int(45000 / LOG_TIME * 3))
         self.connected = False
         self.disconnect()
         self.ble.irq(self.ble_irq)
@@ -179,6 +176,17 @@ class Bluetooth:
         self.dive_timer = Timer(1)
         self.dive_timer.init(period=PID_CALLBACK_TIME, mode=Timer.PERIODIC, callback=lambda t: self.run())
         self.elapsed = 0
+        self.desired_depth = 2.5
+        self.safety = 10
+    
+    def update_dive_time(self, dive_time):
+        self.dive_time = dive_time
+
+    def update_desired_depth(self, desired_depth):
+        self.desired_depth = desired_depth
+
+    def update_safety(self, safety):
+        self.safety = safety
 
     def connect(self, data):
         self.connHandle = data[0]
@@ -238,7 +246,7 @@ class Bluetooth:
     def dive(self, dive_milliliters, kp, ki, kd, equilibrium, integral_bound):
         self.syringe.pos = 0
         self.syringe.move(dive_milliliters)
-        self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, equilibrium, integral_bound)
+        self.pid = PID(self.pressure_sensor, self.syringe, kp, ki, kd, equilibrium, integral_bound, self.desired_depth)
         
         self.dive_milliliters = dive_milliliters
         self.dive_start_time = ticks_ms()
@@ -248,10 +256,10 @@ class Bluetooth:
         self.syringe.update() 
         if self.pid is not None:
             self.elapsed = ticks_ms() - self.dive_start_time
-            if self.elapsed < DIVE_TIME:
+            if self.elapsed < self.dive_time:
                 self.pid.run()
             else:
-                self.syringe.move(5)
+                self.syringe.move(-self.safety)
                 self.pid = None
 
     def parse_request(self, buffer):
@@ -268,7 +276,6 @@ class Bluetooth:
                 kd = kd_raw / 1000.0
                 return 'd', [dive_ml, kp, ki, kd, ke, integral_bound]
             except:
-                print("Failed to unpack dive")
                 return None, None
                 
         elif cmd_id == CMD_MOVE_FORWARD and len(buffer) >= 2:
@@ -285,6 +292,13 @@ class Bluetooth:
             except:
                 return None, None
         
+        elif cmd_id == CMD_UPDATE_PARAMETERS and len(buffer) >= 2:
+            try:
+                _, amount = struct.unpack('>BB', buffer[:2])
+                return 'b', amount
+            except:
+                return None, None
+
         elif cmd_id == CMD_STOP:
             try:
                 return 's', 0;
