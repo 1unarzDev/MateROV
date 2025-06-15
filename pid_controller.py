@@ -202,10 +202,9 @@ def stop():
     diver_com.send(data)
 
 def reset_graph():
-    global base_time, depths, times, proportionals, integrals, derivatives
+    global base_time, depths, proportionals, integrals, derivatives
     base_time = None
     depths = []
-    times = []
     proportionals = []
     integrals = []
     derivatives = []
